@@ -1,0 +1,22 @@
+# config and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# tor runtime data
+/tor-data/
+/bridge-data/
+
+# runtime logs
+*.log
+/logs/
+
+# macOS metadata
+.DS_Store
+._*
+
+# temp files
+*.swp
+*.swo
+*~

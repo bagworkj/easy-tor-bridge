@@ -1,0 +1,24 @@
+name: easy-tor-bridge
+
+services:
+  obfs4-bridge:
+    image: thetorproject/obfs4-bridge:latest
+    restart: unless-stopped
+    environment:
+      EMAIL: "${EMAIL:?Set EMAIL in .env to your operator contact email}"
+      NICKNAME: "${NICKNAME:-EasyTorBridge}"
+      OR_PORT: "${OR_PORT:-9001}"
+      PT_PORT: "${PT_PORT:-8443}"
+    ports:
+      - "${OR_PORT:-9001}:${OR_PORT:-9001}/tcp"
+      - "${PT_PORT:-8443}:${PT_PORT:-8443}/tcp"
+    volumes:
+      - tor-data:/var/lib/tor
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  tor-data:
