@@ -20,3 +20,6 @@
 *.swp
 *.swo
 *~
+
+# Python regression-test bytecode
+__pycache__/
