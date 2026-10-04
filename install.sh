@@ -1,3 +1,4 @@
+#!/bin/bash
 # Run as your regular user: ./install.sh
 set -euo pipefail
 
@@ -8,85 +9,170 @@ PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$PROJECT_DIR"
 [[ -f compose.yaml && -f .env.example ]] || fail 'Keep install.sh beside compose.yaml and .env.example.'
 
+# Keep all commands on the dedicated local Colima engine.
 unset DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
-DOCKER_APP=/Applications/Docker.app
-if [[ ! -d "$DOCKER_APP" && -d "$HOME/Applications/Docker.app" ]]; then
-    DOCKER_APP="$HOME/Applications/Docker.app"
-fi
-INSTALL_TMP=''
-cleanup() {
-    if [[ -n "$INSTALL_TMP" ]]; then
-        if mount | /usr/bin/grep -Fq " on $INSTALL_TMP/mount "; then
-            hdiutil detach "$INSTALL_TMP/mount" -quiet || return
-        fi
-        rm -rf -- "$INSTALL_TMP"
+PROFILE=easy-tor-bridge
+CONTEXT=colima-easy-tor-bridge
+printf '\n[1/5] Install dependencies\n'
+if [[ -x /opt/homebrew/bin/brew ]]; then
+    BREW=/opt/homebrew/bin/brew
+elif [[ -x /usr/local/bin/brew ]]; then
+    BREW=/usr/local/bin/brew
+elif command -v brew >/dev/null 2>&1; then
+    BREW=$(command -v brew)
+else
+    printf '  Installing Homebrew. Follow its terminal prompts.\n'
+    brew_installer=$(mktemp "${TMPDIR:-/tmp}/easy-tor-brew.XXXXXX")
+    trap 'rm -f "$brew_installer"' EXIT
+    curl --fail --location --retry 3 --proto '=https' --proto-redir '=https' \
+        https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$brew_installer"
+    /bin/bash "$brew_installer"
+    rm -f "$brew_installer"
+    trap - EXIT
+    if [[ -x /opt/homebrew/bin/brew ]]; then
+        BREW=/opt/homebrew/bin/brew
+    else
+        BREW=/usr/local/bin/brew
     fi
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-if [[ ! -d "$DOCKER_APP" ]]; then
-    case $(uname -m) in
-        arm64) ARCH=arm64 ;;
-        x86_64)
-            if [[ $(sysctl -in sysctl.proc_translated 2>/dev/null || true) == 1 ]]; then
-                ARCH=arm64
-            else
-                ARCH=amd64
-            fi ;;
-        *) fail 'Unsupported Mac architecture.' ;;
-    esac
-    printf 'Downloading Docker Desktop (%s)...\n' "$ARCH"
-    INSTALL_TMP=$(mktemp -d "${TMPDIR:-/tmp}/easy-tor-bridge.XXXXXX")
-    curl --fail --location --retry 3 --connect-timeout 30 \
-        --proto '=https' --proto-redir '=https' \
-        "https://desktop.docker.com/mac/main/$ARCH/Docker.dmg" \
-        --output "$INSTALL_TMP/Docker.dmg"
-    mkdir "$INSTALL_TMP/mount"
-    hdiutil attach "$INSTALL_TMP/Docker.dmg" -nobrowse -readonly \
-        -mountpoint "$INSTALL_TMP/mount" -quiet
-    # Verify the mounted app before executing its privileged installer.
-    codesign --verify --deep --strict "$INSTALL_TMP/mount/Docker.app"
-    codesign --verify -R 'anchor apple generic and certificate leaf[subject.OU] = "9BNSXJN65R"' \
-        "$INSTALL_TMP/mount/Docker.app"
-    printf 'Installing Docker Desktop; macOS may request your password.\n'
-    sudo "$INSTALL_TMP/mount/Docker.app/Contents/MacOS/install"
-    cleanup
-    INSTALL_TMP=''
 fi
+BREW_PREFIX=$("$BREW" --prefix)
+export PATH="$BREW_PREFIX/bin:$PATH"
+for dependency in colima docker docker-compose; do
+    if ! "$BREW" list --versions "$dependency" >/dev/null 2>&1; then
+        "$BREW" install "$dependency"
+    fi
+done
+DOCKER="$BREW_PREFIX/opt/docker/bin/docker"
+# Invoke Homebrew's Compose directly; no edits to the user's Docker config.
+COMPOSE="$BREW_PREFIX/opt/docker-compose/bin/docker-compose"
+compose() { "$COMPOSE" --context "$CONTEXT" "$@"; }
 
-DOCKER="$DOCKER_APP/Contents/Resources/bin/docker"
-[[ -x "$DOCKER" ]] || fail 'Docker Desktop is incomplete. Reinstall it and rerun setup.'
-export PATH="$DOCKER_APP/Contents/Resources/bin:$PATH"
-open "$DOCKER_APP"
-printf 'Waiting for Docker Desktop. Complete any first-run prompts in Docker.\n'
-# Explicit context avoids accidentally deploying to a remote engine.
+printf '\n[2/5] Start Colima\n'
+colima start "$PROFILE" --runtime docker --activate=false --network-host-addresses
 ready=false
-for ((attempt=0; attempt<120; attempt++)); do
-    if "$DOCKER" --context desktop-linux info >/dev/null 2>&1; then
+for ((attempt=0; attempt<60; attempt++)); do
+    if "$DOCKER" --context "$CONTEXT" info >/dev/null 2>&1; then
         ready=true
         break
     fi
     sleep 5
 done
-[[ $ready == true ]] || fail 'Docker was not ready within 10 minutes. Finish Docker setup and rerun ./install.sh.'
-"$DOCKER" --context desktop-linux compose version >/dev/null || fail 'Docker Compose is missing. Repair Docker Desktop.'
+[[ $ready == true ]] || fail 'Colima engine did not become ready. Check colima status easy-tor-bridge.'
+compose version >/dev/null || fail 'Docker Compose could not start.'
 
+printf '\n[3/5] Configure bridge\n'
 umask 077
 if [[ ! -e .env ]]; then
     cp .env.example .env
     printf 'Created .env from .env.example.\n'
 fi
 
-if ! "$DOCKER" --context desktop-linux compose config --quiet; then
-    fail 'Edit .env (including EMAIL), then rerun ./install.sh. Existing settings were preserved.'
+
+# Read configuration as data; never source .env as a shell script.
+# Keep an existing nonempty EMAIL, including quoted Compose values.
+configured_email=$(awk '
+    /^[[:space:]]*(export[[:space:]]+)?EMAIL[[:space:]]*=/ {
+        value = $0
+        sub(/^[^=]*=[[:space:]]*/, "", value)
+        sub(/[[:space:]]+#.*$/, "", value)
+        sub(/[[:space:]]*$/, "", value)
+    }
+    END { print value }
+' .env)
+case "$configured_email" in
+    ''|'""'|"''"|\#*)
+        [[ -t 0 ]] || fail 'Email setup needs an interactive terminal. Run ./install.sh in Terminal.'
+        printf '\nBridge contact email\n'
+        printf '  Enter an address Tor operators can use to contact you about your bridge.\n'
+        while true; do
+            printf '\n  Your email: '
+            IFS= read -r bridge_email || fail 'Email entry cancelled. Rerun setup to continue.'
+            # Accept common email syntax; exclude Compose interpolation and quoting.
+            if [[ "$bridge_email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+                break
+            fi
+            printf '  Enter an email such as you@example.com (without spaces).\n'
+        done
+        env_temp=$(mktemp "$PROJECT_DIR/.env.setup.XXXXXX")
+        if ! awk -v email="$bridge_email" '
+            /^[[:space:]]*(export[[:space:]]+)?EMAIL[[:space:]]*=/ {
+                if (!written) print "EMAIL=" email
+                written = 1
+                next
+            }
+            { print }
+            END { if (!written) print "EMAIL=" email }
+        ' .env > "$env_temp"; then
+            rm -f "$env_temp"
+            fail 'Could not save email. Your existing .env was preserved.'
+        fi
+        if ! mv "$env_temp" .env; then
+            rm -f "$env_temp"
+            fail 'Could not replace .env with the updated configuration.'
+        fi
+        printf '  Email saved. Other bridge settings were preserved.\n'
+        ;;
+    *) printf 'Using the contact email already configured in .env.\n' ;;
+esac
+
+if ! compose config --quiet; then
+    fail 'Bridge configuration is invalid. Review the Compose error above and your .env settings, then rerun setup.'
 fi
-printf 'Pulling Tor and its transport, then starting the bridge...\n'
-"$DOCKER" --context desktop-linux compose pull obfs4-bridge
-"$DOCKER" --context desktop-linux compose up -d obfs4-bridge
-printf '\nContainer started. Tor bootstrap and Internet reachability are not yet verified.\n'
-printf 'View logs: docker --context desktop-linux compose logs -f --tail=100\n'
-printf 'Bridge line: docker --context desktop-linux compose exec obfs4-bridge get-bridge-line\n'
-printf 'Keep your Mac awake and Docker running. Enable Docker startup at login in Docker settings.\n'
-printf 'Home networks may require forwarding both configured TCP ports.\n'
+printf '\n[4/5] Start bridge container\n'
+# Fetch on first install; rerunning setup does not implicitly upgrade the image.
+compose up -d --pull missing obfs4-bridge
+
+# Check only the current process lifetime, rechecking state to catch restarts.
+wait_for_bootstrap() {
+    local deadline container_id state logs confirmed_state
+    deadline=$((SECONDS + 300))
+    while (( SECONDS < deadline )); do
+        container_id=$(compose ps -a -q obfs4-bridge) || return 2
+        [[ -n "$container_id" ]] || return 2
+        state=$("$DOCKER" --context "$CONTEXT" inspect \
+            --format '{{.State.Status}}|{{.State.StartedAt}}' "$container_id") || return 2
+        case "$state" in
+            running\|*)
+                logs=$("$DOCKER" --context "$CONTEXT" logs --since "${state#*|}" "$container_id" 2>&1) || return 2
+                if [[ "$logs" == *'Bootstrapped 100% (done):'* ]]; then
+                    confirmed_state=$("$DOCKER" --context "$CONTEXT" inspect \
+                        --format '{{.State.Status}}|{{.State.StartedAt}}' "$container_id") || return 2
+                    [[ "$state" != "$confirmed_state" ]] || return 0
+                fi ;;
+            restarting\|*|created\|*) ;;
+            *) return 2 ;;
+        esac
+        sleep 5
+    done
+    return 1
+}
+
+printf '\n[5/5] Verify Tor bootstrap\n'
+printf '  Waiting up to 5 minutes for Tor to connect...\n'
+if wait_for_bootstrap; then
+    printf '  Tor bootstrap complete.\n'
+else
+    result=$?
+    if [[ $result -eq 1 ]]; then
+        printf '  Bootstrap is still pending. The container has been left running.\n'
+    else
+        printf '  Could not verify bootstrap: the container stopped or Docker returned an error.\n'
+    fi
+    printf '  Inspect logs: docker-compose --context colima-easy-tor-bridge logs -f --tail=100\n'
+    exit 1
+fi
+cat <<'SUMMARY'
+
+Setup complete
+  Tor bootstrap          Complete
+  Internet reachability  Unverified
+
+Watch logs:
+  docker-compose --context colima-easy-tor-bridge logs -f --tail=100
+Get your bridge line:
+  docker-compose --context colima-easy-tor-bridge exec obfs4-bridge get-bridge-line
+
+Keep your Mac awake. After a reboot, rerun ./install.sh to start Colima
+and the bridge. Automatic Colima startup is not configured by this script.
+Home routers may require forwarding both configured TCP ports.
+SUMMARY
