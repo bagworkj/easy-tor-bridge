@@ -23,6 +23,8 @@ def functions(*names):
     runtime = ROOT / 'scripts/bridge-runtime.sh'
     if runtime.exists():
         source += '\n' + runtime.read_text()
+    if (ROOT / 'bridge').exists():
+        source += '\n' + (ROOT / 'bridge').read_text()
     found = []
     for name in names:
         match = re.search(r'^' + name + r'\(\) \{\n.*?^\}', source, re.M | re.S)
@@ -78,6 +80,37 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(config['services']['obfs4-bridge']['environment']['EMAIL'], 'saved@example.invalid')
         self.assertEqual(config['services']['obfs4-bridge']['environment']['PT_PORT'], '8443')
         self.assertEqual(config['volumes']['tor-data']['name'], 'easy-tor-bridge_tor-data')
+
+    def test_bridge_status_link_opens_only_with_valid_fingerprint_and_consent(self):
+        fingerprint = 'B0E566C9031657EA7ED3FC9D248E8AC4F37635A4'
+        self.env.update(DOCKER='fake-docker', LINE=f'obfs4 1.2.3.4:8443 {fingerprint} cert=example iat-mode=0')
+        script = functions('show_bridge_status') + r"""
+warning() { echo "$*"; }
+run_bounded() {
+    case " $* " in
+        *' ps '*) echo container ;;
+        *' exec '*) echo "$LINE" ;;
+        *) return 99 ;;
+    esac
+}
+open() { printf '%s' "$1" > "$HOME/opened-url"; }
+show_bridge_status
+"""
+        result = self.shell(script, tty=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        url = 'https://bridges.torproject.org/status?id=' + fingerprint
+        self.assertIn(url, result.stdout)
+        self.assertEqual((self.home / 'opened-url').read_text(), url)
+        (self.home / 'opened-url').unlink()
+        result = self.shell(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(url, result.stdout)
+        self.assertFalse((self.home / 'opened-url').exists())
+        self.env['LINE'] = 'obfs4 1.2.3.4:8443 invalid cert=example'
+        result = self.shell(script, tty=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('status?id=', result.stdout)
+        self.assertFalse((self.home / 'opened-url').exists())
 
     def bootstrap_script(self):
         return functions('wait_for_bootstrap') + r'''
@@ -143,7 +176,7 @@ warning() { :; }
 fail() { echo "$*" >&2; exit 1; }
 launchctl() { [[ $1 != print ]]; }
 BREW_PREFIX='/opt/test & brew'
-''' + functions('configure_autostart') + '\nconfigure_autostart'
+''' + functions('configure_autostart', 'set_autostart', 'unload_autostart') + '\nconfigure_autostart'
         result = self.shell(script, tty=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         path = self.home / 'Library/LaunchAgents/org.easy-tor-bridge.colima.plist'
@@ -151,6 +184,113 @@ BREW_PREFIX='/opt/test & brew'
         self.assertTrue(data.get('AbandonProcessGroup'))
         self.assertEqual(data.get('KeepAlive'), {'SuccessfulExit': False})
         self.assertEqual(data['ProgramArguments'][:3], ['/opt/test & brew/bin/colima', 'start', 'easy-tor-bridge'])
+
+
+class BridgeTests(unittest.TestCase):
+    setUp = InstallerTests.setUp
+    shell = InstallerTests.shell
+
+    def setUp(self):
+        InstallerTests.setUp(self)
+        self.project = self.home / 'clone with spaces'
+        self.project.mkdir()
+        shutil.copytree(ROOT / 'scripts', self.project / 'scripts')
+        shutil.copyfile(ROOT / 'compose.yaml', self.project / 'compose.yaml')
+        (self.project / '.env').write_text('EMAIL=test@example.invalid\n')
+        if (ROOT / 'bridge').exists():
+            shutil.copyfile(ROOT / 'bridge', self.project / 'bridge')
+            (self.project / 'bridge').chmod(0o755)
+        self.env['EVENTS'] = str(self.home / 'events')
+        self.env['TEST_PREFIX'] = str(self.home)
+        tools = {
+            'brew': 'echo "$TEST_PREFIX"',
+            'colima': 'echo "colima $*" >> "$EVENTS"',
+            'launchctl': 'echo "launchctl $*" >> "$EVENTS"; [[ $1 != print ]]',
+            'docker': r'''echo "docker $*" >> "$EVENTS"
+case " $* " in
+    *' inspect '*) echo "${TEST_STATE:-running}|2026-10-06T01:00:00Z" ;;
+    *' logs '*) echo 'Bootstrapped 100% (done): Done' ;;
+esac''',
+            'docker-compose': r'''echo "compose $*" >> "$EVENTS"
+case " $* " in *' ps '*) echo container ;; esac''',
+        }
+        for name, body in tools.items():
+            path = self.home / name
+            path.write_text('#!/bin/bash\n' + body + '\n')
+            path.chmod(0o755)
+        for name in ('docker', 'docker-compose'):
+            directory = self.home / 'opt' / name / 'bin'
+            directory.mkdir(parents=True)
+            (directory / name).symlink_to(self.home / name)
+        self.agent = self.home / 'Library/LaunchAgents/org.easy-tor-bridge.colima.plist'
+
+    def command(self, *args):
+        return subprocess.run(['/bin/bash', str(self.project / 'bridge'), *args],
+                              env=self.env, cwd=self.home, capture_output=True, text=True, timeout=8)
+
+    def test_up_uses_saved_project_from_symlink_and_checks_bootstrap(self):
+        link = self.home / 'bridge-link'
+        link.symlink_to(self.project / 'bridge')
+        result = subprocess.run(['/bin/bash', str(link), 'up'], env=self.env,
+                                cwd=self.home, capture_output=True, text=True, timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = Path(self.env['EVENTS']).read_text()
+        self.assertIn('start easy-tor-bridge --runtime docker --activate=false --network-host-addresses', events)
+        self.assertIn(str(self.project / '.env'), events)
+        self.assertIn('up -d --pull missing obfs4-bridge', events)
+        self.assertIn('bootstrap', result.stdout.lower())
+        self.assertFalse(self.agent.exists())
+
+    def test_down_preserves_login_setting_and_identity(self):
+        self.agent.parent.mkdir(parents=True)
+        self.agent.write_text('preserve login setting')
+        result = self.command('down')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.agent.read_text(), 'preserve login setting')
+        events = Path(self.env['EVENTS']).read_text()
+        self.assertIn('colima stop easy-tor-bridge', events)
+        self.assertNotIn('compose', events)
+        self.assertTrue((self.project / '.env').exists())
+
+    def test_launchagent_flags_enable_then_disable_startup(self):
+        result = self.command('up', '--launchagent')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = plistlib.loads(self.agent.read_bytes())
+        self.assertTrue(data['AbandonProcessGroup'])
+        self.assertEqual(data['KeepAlive'], {'SuccessfulExit': False})
+        result = self.command('down', '--launchagent')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.agent.exists())
+        self.assertTrue((self.project / '.env').exists())
+
+    def test_bootstrap_failure_does_not_enable_launchagent(self):
+        self.env['TEST_STATE'] = 'exited'
+        result = self.command('up', '--launchagent')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('bootstrap was not confirmed', result.stderr)
+        self.assertFalse(self.agent.exists())
+        events = Path(self.env['EVENTS']).read_text()
+        self.assertNotIn('colima stop', events)
+        self.assertNotIn('launchctl bootstrap', events)
+
+    def test_invalid_arguments_do_not_touch_services(self):
+        result = self.command('down', '--launchagent', 'unexpected')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('Usage:', result.stderr)
+        self.assertFalse(Path(self.env['EVENTS']).exists())
+
+    def test_install_command_preserves_unrelated_file(self):
+        self.env['PROJECT_DIR'] = str(self.project)
+        target = self.home / '.local/bin/bridge'
+        target.parent.mkdir(parents=True)
+        target.write_text('someone else owns this')
+        result = self.shell(functions('install_bridge_command') + '\nwarning() { :; }\ninstall_bridge_command')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_text(), 'someone else owns this')
+        target.unlink()
+        result = self.shell(functions('install_bridge_command') + '\nwarning() { :; }\ninstall_bridge_command')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.resolve(), (self.project / 'bridge').resolve())
 
 
 class NetworkTests(unittest.TestCase):

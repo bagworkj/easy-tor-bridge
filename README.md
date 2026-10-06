@@ -18,6 +18,27 @@ project's config.
 
 Bridge identity lives in the named Docker volume: deleting that volume deletes the identity.
 
+## Bridge commands
+
+After setup:
+
+```bash
+bridge up                  # Start the dedicated VM and bridge; verify bootstrap
+bridge down                # Stop the VM and bridge; preserve startup at next login
+bridge up --launchagent    # Start and enable startup at login
+bridge down --launchagent  # Disable startup at login and stop
+```
+
+These commands preserve your `.env` and Tor identity volume. They control only
+this project's Colima profile. `up` uses the existing image.
+
+Setup installs a symlink at `~/.local/bin/bridge`. If that directory is not on
+your PATH, run this in your terminal and add the same line to `~/.zshrc`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 ## Bootstrap and reachability
 
 Bootstrap means Tor connected to its network, but not that inbound connections
@@ -27,10 +48,8 @@ commands. A timeout ends the check without stopping the container.
 Once success is observed, a private record is saved under
 `~/Library/Application Support/easy-tor-bridge/bootstrap`. It records the
 container ID and start time.
-
-Use [Tor's TCP reachability test](https://bridges.torproject.org/scan/) with
-your public IP and obfs4 port. Home routers may need TCP forwarding for both
-configured ports. Managed networks may block inbound traffic.
+Home routers may need TCP forwarding for both configured ports. Managed
+networks may block inbound traffic.
 
 ## Local network diagnostics
 

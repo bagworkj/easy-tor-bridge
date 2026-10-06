@@ -20,7 +20,7 @@ fail() { printf '%sError: %s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
 [[ $EUID -ne 0 ]] || fail 'Run without sudo; setup requests administrator access when needed.'
 PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$PROJECT_DIR"
-[[ -f compose.yaml && -f .env.example && -f scripts/bridge-runtime.sh && -f scripts/network-check.sh ]] || fail 'Run install.sh from a complete copy of this project.'
+[[ -f compose.yaml && -f .env.example && -f scripts/bridge-runtime.sh && -f scripts/network-check.sh && -f bridge ]] || fail 'Run install.sh from a complete copy of this project.'
 [[ -x /usr/bin/perl ]] || fail 'The macOS Perl runtime is required for bounded health checks.'
 source "$PROJECT_DIR/scripts/bridge-runtime.sh"
 BOOTSTRAP_CACHE="$HOME/Library/Application Support/easy-tor-bridge/bootstrap"
@@ -75,16 +75,7 @@ COMPOSE="$BREW_PREFIX/opt/docker-compose/bin/docker-compose"
 
 
 heading '[2/6] Start Colima'
-colima start "$PROFILE" --runtime docker --activate=false --network-host-addresses
-ready=false
-for ((attempt=0; attempt<60; attempt++)); do
-    if run_bounded 5 "$DOCKER" --context "$CONTEXT" info >/dev/null 2>&1; then
-        ready=true
-        break
-    fi
-    sleep 5
-done
-[[ $ready == true ]] || fail 'Colima engine did not become ready. Check colima status easy-tor-bridge.'
+start_engine
 "$COMPOSE" version >/dev/null || fail 'Docker Compose could not start.'
 
 heading '[3/6] Configure bridge'
@@ -191,11 +182,7 @@ fi
 # A per-user LaunchAgent starts only this project's Colima profile at login.
 # Container restart policies bring the bridge back when its engine starts.
 configure_autostart() {
-    local agent_dir agent_file label domain answer agent_temp
-    agent_dir="$HOME/Library/LaunchAgents"
-    label=org.easy-tor-bridge.colima
-    agent_file="$agent_dir/$label.plist"
-    domain="gui/$(id -u)"
+    local answer
     AUTOSTART_STATUS='Not configured'
     heading 'Automatic startup'
     printf '  Colima starts at login and stays running after logout while the Mac is awake.\n'
@@ -216,54 +203,49 @@ configure_autostart() {
         case "$answer" in
             y|Y|yes|YES) break ;;
             n|N|no|NO)
-                if launchctl print "$domain/$label" >/dev/null 2>&1; then
-                    launchctl bootout "$domain/$label" || fail 'Could not disable automatic startup.'
-                fi
-                rm -f "$agent_file"
-                AUTOSTART_STATUS='Disabled'
+                set_autostart off
                 return ;;
             *) printf '  Please enter y or n: ' ;;
         esac
     done
-    mkdir -p "$agent_dir"
-    agent_temp=$(mktemp "$agent_dir/.easy-tor-bridge.XXXXXX")
-    # plutil encodes paths safely, including spaces and XML special characters.
-    /usr/bin/plutil -create xml1 "$agent_temp"
-    /usr/bin/plutil -insert Label -string "$label" "$agent_temp"
-    /usr/bin/plutil -insert ProgramArguments -array "$agent_temp"
-    /usr/bin/plutil -insert ProgramArguments.0 -string "$BREW_PREFIX/bin/colima" "$agent_temp"
-    /usr/bin/plutil -insert ProgramArguments.1 -string start "$agent_temp"
-    /usr/bin/plutil -insert ProgramArguments.2 -string "$PROFILE" "$agent_temp"
-    /usr/bin/plutil -insert ProgramArguments.3 -string '--activate=false' "$agent_temp"
-    /usr/bin/plutil -insert RunAtLoad -bool YES "$agent_temp"
-    # Colima detaches its VM processes; preserve them when this one-shot job exits.
-    # This also leaves the bridge running on logout, until Colima or the Mac stops.
-    /usr/bin/plutil -insert AbandonProcessGroup -bool YES "$agent_temp"
-    /usr/bin/plutil -insert KeepAlive -dictionary "$agent_temp"
-    /usr/bin/plutil -insert KeepAlive.SuccessfulExit -bool NO "$agent_temp"
-    /usr/bin/plutil -insert ThrottleInterval -integer 30 "$agent_temp"
-    /usr/bin/plutil -insert EnvironmentVariables -dictionary "$agent_temp"
-    /usr/bin/plutil -insert EnvironmentVariables.PATH -string "$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$agent_temp"
-    /usr/bin/plutil -insert EnvironmentVariables.HOME -string "$HOME" "$agent_temp"
-    /usr/bin/plutil -lint "$agent_temp" >/dev/null
-    chmod 600 "$agent_temp"
-    if launchctl print "$domain/$label" >/dev/null 2>&1; then
-        launchctl bootout "$domain/$label" || fail 'Could not reload automatic startup.'
-    fi
-    mv "$agent_temp" "$agent_file"
-    launchctl enable "$domain/$label"
-    launchctl bootstrap "$domain" "$agent_file" || fail 'Could not register automatic startup for this login session.'
-    AUTOSTART_STATUS='Enabled at login'
+    set_autostart on
 }
 configure_autostart
+install_bridge_command
+
+show_bridge_status() {
+    local cid='' line='' fingerprint='' url answer=''
+    cid=$(run_bounded 10 "$DOCKER" --context "$CONTEXT" ps -q \
+        --filter label=com.docker.compose.project=easy-tor-bridge \
+        --filter label=com.docker.compose.service=obfs4-bridge 2>/dev/null) || cid=''
+    if [[ -n "$cid" ]]; then
+        line=$(run_bounded 10 "$DOCKER" --context "$CONTEXT" exec "$cid" get-bridge-line 2>/dev/null) || line=''
+    fi
+    fingerprint=$(printf '%s\n' "$line" | awk '$1 == "obfs4" && length($3) == 40 && $3 !~ /[^0-9A-Fa-f]/ {print toupper($3); exit}')
+    if [[ -z "$fingerprint" ]]; then
+        warning 'Bridge status link unavailable — Could not retrieve a valid bridge fingerprint; rerun setup later.'
+        return 0
+    fi
+    url="https://bridges.torproject.org/status?id=$fingerprint"
+    printf '\nTor bridge status:\n  %s\n' "$url"
+    printf '  Status information may lag; opening this page does not verify current Internet reachability.\n'
+    if [[ -t 0 ]]; then
+        printf '  Open status page in your browser? [y/N]: '
+        IFS= read -r answer || answer=''
+        case "$answer" in
+            y|Y|yes|YES) open "$url" || warning 'Could not open the browser; use the link above.' ;;
+        esac
+    fi
+    return 0
+}
 
 heading 'Setup Complete'
 success 'Tor bootstrap — Complete'
 printf '  Local networking — %s\n' "$LOCAL_NETWORK_STATUS"
 warning 'Internet reachability — Unverified'
 printf '  Automatic startup — %s\n' "$AUTOSTART_STATUS"
-printf '\nTest your public IP and obfs4 port:\n  https://bridges.torproject.org/scan/\n'
+show_bridge_status
 printf '\nKeep your Mac awake. Home routers may require forwarding both TCP ports.\n'
 if [[ "$AUTOSTART_STATUS" != 'Enabled at login' ]]; then
-    printf 'Rerun ./install.sh after restarting your Mac to start the bridge.\n'
+    printf 'Run bridge up (or ./bridge from this repository) to start the bridge.\n'
 fi

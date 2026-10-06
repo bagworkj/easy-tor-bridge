@@ -93,6 +93,86 @@ wait_for_bootstrap() {
     return 1
 }
 
+unload_autostart() {
+    local label=org.easy-tor-bridge.colima domain="gui/$(id -u)"
+    if launchctl print "$domain/$label" >/dev/null 2>&1; then
+        launchctl bootout "$domain/$label" || fail 'Could not unload automatic startup.'
+    fi
+}
+
+set_autostart() {
+    local agent_dir="$HOME/Library/LaunchAgents" agent_file label=org.easy-tor-bridge.colima
+    local domain="gui/$(id -u)" agent_temp
+    agent_file="$agent_dir/$label.plist"
+    if [[ $1 == off ]]; then
+        unload_autostart
+        rm -f "$agent_file"
+        AUTOSTART_STATUS='Disabled'
+        return
+    fi
+    mkdir -p "$agent_dir"
+    agent_temp=$(mktemp "$agent_dir/.easy-tor-bridge.XXXXXX")
+    # plutil encodes paths safely, including spaces and XML special characters.
+    /usr/bin/plutil -create xml1 "$agent_temp"
+    /usr/bin/plutil -insert Label -string "$label" "$agent_temp"
+    /usr/bin/plutil -insert ProgramArguments -array "$agent_temp"
+    /usr/bin/plutil -insert ProgramArguments.0 -string "$BREW_PREFIX/bin/colima" "$agent_temp"
+    /usr/bin/plutil -insert ProgramArguments.1 -string start "$agent_temp"
+    /usr/bin/plutil -insert ProgramArguments.2 -string "$PROFILE" "$agent_temp"
+    /usr/bin/plutil -insert ProgramArguments.3 -string '--activate=false' "$agent_temp"
+    /usr/bin/plutil -insert RunAtLoad -bool YES "$agent_temp"
+    # Colima detaches its VM processes; preserve them when this one-shot job exits.
+    # This also leaves the bridge running on logout, until Colima or the Mac stops.
+    /usr/bin/plutil -insert AbandonProcessGroup -bool YES "$agent_temp"
+    /usr/bin/plutil -insert KeepAlive -dictionary "$agent_temp"
+    /usr/bin/plutil -insert KeepAlive.SuccessfulExit -bool NO "$agent_temp"
+    /usr/bin/plutil -insert ThrottleInterval -integer 30 "$agent_temp"
+    /usr/bin/plutil -insert EnvironmentVariables -dictionary "$agent_temp"
+    /usr/bin/plutil -insert EnvironmentVariables.PATH -string "$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$agent_temp"
+    /usr/bin/plutil -insert EnvironmentVariables.HOME -string "$HOME" "$agent_temp"
+    /usr/bin/plutil -lint "$agent_temp" >/dev/null
+    chmod 600 "$agent_temp"
+    unload_autostart
+    mv "$agent_temp" "$agent_file"
+    launchctl enable "$domain/$label"
+    launchctl bootstrap "$domain" "$agent_file" || fail 'Could not register automatic startup for this login session.'
+    AUTOSTART_STATUS='Enabled at login'
+}
+
+start_engine() {
+    local attempt ready=false
+    colima start "$PROFILE" --runtime docker --activate=false --network-host-addresses
+    for ((attempt=0; attempt<60; attempt++)); do
+        if run_bounded 5 "$DOCKER" --context "$CONTEXT" info >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+        sleep 5
+    done
+    [[ $ready == true ]] || fail 'Colima engine did not become ready. Check colima status easy-tor-bridge.'
+}
+
+install_bridge_command() {
+    local target="$HOME/.local/bin/bridge"
+    mkdir -p "$(dirname "$target")"
+    if [[ -e "$target" || -L "$target" ]]; then
+        if [[ -L "$target" && $(readlink "$target") == "$PROJECT_DIR/bridge" ]]; then
+            printf '  bridge command — Already installed\n'
+        else
+            warning 'Existing ~/.local/bin/bridge was preserved; use ./bridge from this repository.'
+            return
+        fi
+    else
+        ln -s "$PROJECT_DIR/bridge" "$target"
+        printf '  bridge command — Installed in ~/.local/bin\n'
+    fi
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) printf '  To use bridge in this terminal, run:\n    export PATH="$HOME/.local/bin:$PATH"\n'
+           printf '  Add that line to ~/.zshrc to keep it for future terminals.\n' ;;
+    esac
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     set -euo pipefail
     DOCKER=$1 COMPOSE=$2 PROJECT_DIR=$3 CONTEXT=$4 BOOTSTRAP_CACHE=$5

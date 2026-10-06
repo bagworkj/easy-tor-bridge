@@ -1,0 +1,68 @@
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+    printf 'Usage: bridge up|down [--launchagent]\n'
+    printf '  up/down: start/stop the bridge; preserve startup at login.\n'
+    printf '  --launchagent: also enable/disable startup at login.\n'
+}
+fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+success() { printf '  ✓ %s\n' "$*"; }
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    up|down) action=$1 ;;
+    *) usage >&2; exit 2 ;;
+esac
+[[ $# -le 2 && ( $# -eq 1 || $2 == --launchagent ) ]] || { usage >&2; exit 2; }
+[[ $(uname -s) == Darwin ]] || fail 'This command supports macOS only.'
+[[ $EUID -ne 0 ]] || fail 'Run without sudo.'
+
+# Resolve the installed symlink back to its clone, including paths with spaces.
+script=${BASH_SOURCE[0]}
+while [[ -L "$script" ]]; do
+    directory=$(cd -- "$(dirname -- "$script")" && pwd)
+    script=$(readlink "$script")
+    [[ "$script" == /* ]] || script="$directory/$script"
+done
+PROJECT_DIR=$(cd -- "$(dirname -- "$script")" && pwd)
+[[ -f "$PROJECT_DIR/scripts/bridge-runtime.sh" ]] || fail 'Project files are missing; rerun setup from a complete clone.'
+source "$PROJECT_DIR/scripts/bridge-runtime.sh"
+PROFILE=easy-tor-bridge CONTEXT=colima-easy-tor-bridge
+unset DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+command -v brew >/dev/null || fail 'Homebrew is missing; run ./install.sh first.'
+BREW_PREFIX=$(brew --prefix)
+export PATH="$BREW_PREFIX/bin:$PATH"
+command -v colima >/dev/null || fail 'Colima is missing; run ./install.sh first.'
+
+if [[ "$action" == down ]]; then
+    if [[ ${2:-} == --launchagent ]]; then
+        set_autostart off
+    else
+        # Prevent a loaded startup job from retrying while stopping. Keep its plist.
+        unload_autostart
+    fi
+    colima stop "$PROFILE"
+    printf 'Bridge stopped. Configuration and identity were preserved.\n'
+    if [[ ${2:-} == --launchagent ]]; then printf 'Startup at login disabled.\n'; fi
+    exit 0
+fi
+
+[[ -f "$PROJECT_DIR/.env" && -f "$PROJECT_DIR/compose.yaml" ]] || fail 'Configuration is missing; run ./install.sh first.'
+DOCKER="$BREW_PREFIX/opt/docker/bin/docker"
+COMPOSE="$BREW_PREFIX/opt/docker-compose/bin/docker-compose"
+[[ -x "$DOCKER" && -x "$COMPOSE" ]] || fail 'Docker dependencies are missing; run ./install.sh first.'
+compose config --quiet
+start_engine
+compose up -d --pull missing obfs4-bridge
+BOOTSTRAP_CACHE="$HOME/Library/Application Support/easy-tor-bridge/bootstrap"
+if ! run_bounded 300 /bin/bash "$PROJECT_DIR/scripts/bridge-runtime.sh" \
+    "$DOCKER" "$COMPOSE" "$PROJECT_DIR" "$CONTEXT" "$BOOTSTRAP_CACHE"; then
+    fail 'Bridge started, but Tor bootstrap was not confirmed. The container was left running.'
+fi
+if [[ ${2:-} == --launchagent ]]; then
+    set_autostart on
+    printf 'Startup at login enabled.\n'
+fi
+printf 'Bridge running; Internet reachability remains unverified.\n'
