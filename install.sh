@@ -20,7 +20,7 @@ fail() { printf '%sError: %s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
 [[ $EUID -ne 0 ]] || fail 'Run without sudo; setup requests administrator access when needed.'
 PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$PROJECT_DIR"
-[[ -f compose.yaml && -f .env.example && -f scripts/bridge-runtime.sh ]] || fail 'Run install.sh from a complete copy of this project.'
+[[ -f compose.yaml && -f .env.example && -f scripts/bridge-runtime.sh && -f scripts/network-check.sh ]] || fail 'Run install.sh from a complete copy of this project.'
 [[ -x /usr/bin/perl ]] || fail 'The macOS Perl runtime is required for bounded health checks.'
 source "$PROJECT_DIR/scripts/bridge-runtime.sh"
 BOOTSTRAP_CACHE="$HOME/Library/Application Support/easy-tor-bridge/bootstrap"
@@ -29,7 +29,7 @@ BOOTSTRAP_CACHE="$HOME/Library/Application Support/easy-tor-bridge/bootstrap"
 unset DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
 PROFILE=easy-tor-bridge
 CONTEXT=colima-easy-tor-bridge
-heading '[1/5] Install dependencies'
+heading '[1/6] Install dependencies'
 homebrew_installed_now=false
 if [[ -x /opt/homebrew/bin/brew ]]; then
     BREW=/opt/homebrew/bin/brew
@@ -74,7 +74,7 @@ DOCKER="$BREW_PREFIX/opt/docker/bin/docker"
 COMPOSE="$BREW_PREFIX/opt/docker-compose/bin/docker-compose"
 
 
-heading '[2/5] Start Colima'
+heading '[2/6] Start Colima'
 colima start "$PROFILE" --runtime docker --activate=false --network-host-addresses
 ready=false
 for ((attempt=0; attempt<60; attempt++)); do
@@ -87,7 +87,7 @@ done
 [[ $ready == true ]] || fail 'Colima engine did not become ready. Check colima status easy-tor-bridge.'
 "$COMPOSE" version >/dev/null || fail 'Docker Compose could not start.'
 
-heading '[3/5] Configure bridge'
+heading '[3/6] Configure bridge'
 umask 077
 if [[ ! -e .env ]]; then
     cp .env.example .env
@@ -145,13 +145,28 @@ esac
 if ! compose config --quiet; then
     fail 'Bridge configuration is invalid. Review the Compose error above and your .env settings, then rerun setup.'
 fi
-heading '[4/5] Start bridge container'
+heading '[4/6] Start bridge container'
+if run_bounded 30 /bin/bash "$PROJECT_DIR/scripts/network-check.sh" pre \
+    "$DOCKER" "$COMPOSE" "$PROJECT_DIR" "$CONTEXT" "$GREEN" "$AMBER" "$RESET"; then
+    :
+else
+    preflight_result=$?
+    [[ $preflight_result -ne 2 ]] || fail 'Check the port configuration above before starting the bridge.'
+    warning 'Port preflight found a conflict or could not finish; container startup will confirm availability.'
+fi
 # Fetch on first install; rerunning setup does not implicitly upgrade the image.
-compose up -d --pull missing obfs4-bridge
+if ! compose up -d --pull missing obfs4-bridge; then
+    warning 'Container startup failed. Gathering local network observations...'
+    run_bounded 90 /bin/bash "$PROJECT_DIR/scripts/network-check.sh" post \
+        "$DOCKER" "$COMPOSE" "$PROJECT_DIR" "$CONTEXT" "$GREEN" "$AMBER" "$RESET" || true
+    fail 'Could not start the bridge. Review the Compose error and network observations above.'
+fi
 
-heading '[5/5] Verify Tor bootstrap'
+heading '[5/6] Verify Tor bootstrap'
+BOOTSTRAP_VERIFIED=false
 if run_bounded 300 /bin/bash "$PROJECT_DIR/scripts/bridge-runtime.sh" \
     "$DOCKER" "$COMPOSE" "$PROJECT_DIR" "$CONTEXT" "$BOOTSTRAP_CACHE" "$GREEN" "$RESET"; then
+    BOOTSTRAP_VERIFIED=true
     printf '  Bootstrap success was observed during this container session.\n'
 else
     result=$?
@@ -162,8 +177,17 @@ else
         printf '  Bootstrap verification failed; check Docker, the container, and local file permissions.\n'
     fi
     printf '  Inspect logs: docker-compose --context colima-easy-tor-bridge logs -f --tail=100\n'
-    exit 1
 fi
+
+heading '[6/6] Local network diagnostics'
+if run_bounded 90 /bin/bash "$PROJECT_DIR/scripts/network-check.sh" post \
+    "$DOCKER" "$COMPOSE" "$PROJECT_DIR" "$CONTEXT" "$GREEN" "$AMBER" "$RESET"; then
+    LOCAL_NETWORK_STATUS='TCP checks passed; firewall observations above'
+else
+    LOCAL_NETWORK_STATUS='Warnings or incomplete checks; see above'
+fi
+[[ $BOOTSTRAP_VERIFIED == true ]] || fail 'Setup incomplete: Tor bootstrap was not confirmed. Local diagnostics are shown above.'
+
 # A per-user LaunchAgent starts only this project's Colima profile at login.
 # Container restart policies bring the bridge back when its engine starts.
 configure_autostart() {
@@ -235,6 +259,7 @@ configure_autostart
 
 heading 'Setup Complete'
 success 'Tor bootstrap — Complete'
+printf '  Local networking — %s\n' "$LOCAL_NETWORK_STATUS"
 warning 'Internet reachability — Unverified'
 printf '  Automatic startup — %s\n' "$AUTOSTART_STATUS"
 printf '\nTest your public IP and obfs4 port:\n  https://bridges.torproject.org/scan/\n'

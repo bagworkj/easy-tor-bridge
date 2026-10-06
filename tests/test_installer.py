@@ -153,5 +153,130 @@ BREW_PREFIX='/opt/test & brew'
         self.assertEqual(data['ProgramArguments'][:3], ['/opt/test & brew/bin/colima', 'start', 'easy-tor-bridge'])
 
 
+class NetworkTests(unittest.TestCase):
+    setUp = InstallerTests.setUp
+    shell = InstallerTests.shell
+
+    def diagnostics(self, scenario, mode='post'):
+        self.env.update(NETWORK_SCRIPT=str(ROOT / 'scripts/network-check.sh'),
+                        RUNTIME=str(ROOT / 'scripts/bridge-runtime.sh'),
+                        SCENARIO=scenario, MODE=mode, DOCKER='fake-docker')
+        script = r'''
+set -eu
+source "$RUNTIME"
+source "$NETWORK_SCRIPT"
+success() { printf 'PASS %s\n' "$*"; }
+warning() { printf 'WARN %s\n' "$*"; }
+heading() { printf '%s\n' "$*"; }
+compose() {
+    [[ $SCENARIO != config-unknown ]] || return 1
+    echo '{"services":{"obfs4-bridge":{"environment":{"OR_PORT":"9001","PT_PORT":"8443"}}}}'
+}
+network_command() {
+    case "$1" in
+        /sbin/route)
+            [[ $SCENARIO != no-route ]] || return 1
+            printf '   gateway: 192.168.1.1\n interface: en0\n' ;;
+        /usr/sbin/ipconfig) echo 192.168.1.42 ;;
+        /sbin/ifconfig) echo 'inet6 fe80::1%en0 prefixlen 64 scopeid 0x4' ;;
+        /usr/sbin/lsof)
+            if [[ $SCENARIO == occupied || $SCENARIO == occupied-prefix ]]; then
+                echo 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME'
+                echo 'otherapp 123 me 4u IPv4 1 0t0 TCP *:9001 (LISTEN)'
+            else return 1; fi ;;
+        /usr/bin/nc) [[ $SCENARIO != failed-probe ]] ;;
+        /usr/libexec/ApplicationFirewall/socketfilterfw)
+            if [[ $SCENARIO == firewall-unknown ]]; then return 1; fi
+            if [[ $2 == --getglobalstate ]]; then echo 'Firewall is enabled. (State = 1)';
+            elif [[ $SCENARIO == block-all ]]; then echo 'Firewall has block all state set to enabled.';
+            else echo 'Firewall has block all state set to disabled.'; fi ;;
+        /sbin/pfctl) return 1 ;;
+        fake-docker)
+            shift 3
+            case "$1" in
+                ps) echo container ;;
+                port)
+                    [[ $SCENARIO != occupied ]] || return 1
+                    if [[ $SCENARIO == occupied-prefix ]]; then echo '0.0.0.0:90010';
+                    else printf '0.0.0.0:%s\n' "${3%/tcp}"; fi ;;
+                inspect) echo 'running|2026-10-06T01:00:00Z' ;;
+                logs)
+                    if [[ $SCENARIO == failed-probe ]]; then
+                        echo 'Your server has not managed to confirm reachability for its ORPort(s)'
+                    else
+                        echo 'Self-testing indicates your ORPort is reachable from outside. Excellent.'
+                    fi ;;
+            esac ;;
+        *) echo 'Unexpected command' >&2; return 99 ;;
+    esac
+}
+network_diagnostics "$MODE"
+'''
+        return self.shell(script)
+
+    def test_local_success_still_leaves_external_obfs4_unverified(self):
+        result = self.diagnostics('healthy')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('192.168.1.42:8443', result.stdout)
+        self.assertIn('OR port — Tor reported external reachability', result.stdout)
+        self.assertIn('obfs4 Internet reachability — Unverified', result.stdout)
+
+    def test_failed_local_probe_gives_forwarding_context_without_claiming_success(self):
+        result = self.diagnostics('failed-probe')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('Local-address TCP test failed', result.stdout)
+        self.assertIn('8443 → 192.168.1.42:8443', result.stdout)
+        self.assertIn('OR port — Tor has not confirmed external reachability', result.stdout)
+
+    def test_missing_route_is_unknown_and_does_not_abort_other_checks(self):
+        result = self.diagnostics('no-route')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('IPv4 route — Unavailable', result.stdout)
+        self.assertIn('macOS application firewall', result.stdout)
+        self.assertIn('obfs4 Internet reachability — Unverified', result.stdout)
+
+    def test_preflight_reports_port_conflict(self):
+        result = self.diagnostics('occupied', mode='pre')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('9001 — Occupied', result.stdout)
+        self.assertIn('otherapp', result.stdout)
+
+    def test_configuration_command_has_its_own_watchdog(self):
+        self.env.update(NETWORK_SCRIPT=str(ROOT / 'scripts/network-check.sh'),
+                        RUNTIME=str(ROOT / 'scripts/bridge-runtime.sh'))
+        result = self.shell(r"""
+source "$RUNTIME"
+source "$NETWORK_SCRIPT"
+# Use the actual watchdog with a shorter deadline for this regression check.
+eval "$(declare -f run_bounded | sed '1s/run_bounded/original_run_bounded/')"
+run_bounded() { shift; original_run_bounded 1 "$@"; }
+compose() { sleep 30; }
+network_config
+""")
+        self.assertEqual(result.returncode, 124, result.stderr)
+
+    def test_config_failure_preserves_independent_observations(self):
+        result = self.diagnostics('config-unknown')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('Mac IPv4 address', result.stdout)
+        self.assertIn('macOS application firewall', result.stdout)
+        self.assertIn('obfs4 Internet reachability — Unverified', result.stdout)
+
+    def test_mapping_requires_exact_port_match(self):
+        result = self.diagnostics('occupied-prefix', mode='pre')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('9001 — Occupied', result.stdout)
+
+    def test_block_all_firewall_is_a_warning(self):
+        result = self.diagnostics('block-all')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('Block all incoming connections — Enabled', result.stdout)
+
+    def test_unreadable_firewall_is_unknown_not_disabled(self):
+        result = self.diagnostics('firewall-unknown')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('macOS application firewall — Unknown', result.stdout)
+
+
 if __name__ == '__main__':
     unittest.main()

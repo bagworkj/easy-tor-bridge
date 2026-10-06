@@ -32,13 +32,24 @@ Use [Tor's TCP reachability test](https://bridges.torproject.org/scan/) with
 your public IP and obfs4 port. Home routers may need TCP forwarding for both
 configured ports. Managed networks may block inbound traffic.
 
+## Local network diagnostics
+
+Setup checks for visible port conflicts. After
+bootstrap it prints the default IPv4 interface, gateway, and local address;
+Docker's published endpoints; and short TCP connection tests against loopback
+and that local address for both ports. These connection tests cover IPv4 only. 
+
+The report reads the macOS application firewall's global/block-all settings.
+Unknown means the command could not establish the state.
+
+All TCP probes originate on your device. Diagnostics do not create router
+mappings, look up your public IP, or send requests to an external checker.
+
 ## Optional automatic startup
 
 Answer `y` to start the dedicated `easy-tor-bridge` Colima profile at login.
-A per-user LaunchAgent preserves Colima's background processes after the
-startup command exits and retries failed starts. It does not supervise the
-VM continuously after a successful start. Colima remains running after logout
-while the Mac is awake; nothing runs before the first login after a reboot.
+A per-user LaunchAgent preserves Colima's background processes. Colima 
+remains running after logout while the Mac is awake.
 
 Answer `n` on a later run to remove this project's automatic-startup setting.
 That does not stop a currently running bridge.
