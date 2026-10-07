@@ -12,9 +12,9 @@ if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
         AMBER=$'\033[33m'
     fi
 fi
-success() { printf '  %s✓ %s%s\n' "$GREEN" "$*" "$RESET"; }
-warning() { printf '  %s! %s%s\n' "$AMBER" "$*" "$RESET"; }
-heading() { printf '\n%s%s%s\n' "$BOLD" "$*" "$RESET"; }
+success() { progress '  %s✓ %s%s\n' "$GREEN" "$*" "$RESET"; }
+warning() { progress '  %s! %s%s\n' "$AMBER" "$*" "$RESET"; }
+heading() { progress '\n%s%s%s\n' "$BOLD" "$*" "$RESET"; }
 fail() { printf '%sError: %s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
 [[ $(uname -s) == Darwin ]] || fail 'This installer supports macOS only.'
 [[ $EUID -ne 0 ]] || fail 'Run without sudo; setup requests administrator access when needed.'
@@ -38,7 +38,7 @@ elif [[ -x /usr/local/bin/brew ]]; then
 elif command -v brew >/dev/null 2>&1; then
     BREW=$(command -v brew)
 else
-    printf '  Installing Homebrew. Follow its terminal prompts.\n'
+    progress '  Installing Homebrew. Follow its terminal prompts.\n'
     brew_installer=$(mktemp "${TMPDIR:-/tmp}/easy-tor-brew.XXXXXX")
     trap 'rm -f "$brew_installer"' EXIT
     curl --fail --location --retry 3 --proto '=https' --proto-redir '=https' \
@@ -64,7 +64,7 @@ for dependency in colima docker docker-compose; do
     if "$BREW" list --versions "$dependency" >/dev/null 2>&1; then
         success "$dependency — already installed"
     else
-        printf '  Installing %s...\n' "$dependency"
+        progress '  Installing %s...\n' "$dependency"
         "$BREW" install "$dependency"
         success "$dependency — installed"
     fi
@@ -82,7 +82,7 @@ heading '[3/6] Configure bridge'
 umask 077
 if [[ ! -e .env ]]; then
     cp .env.example .env
-    printf 'Created .env from .env.example.\n'
+    progress 'Created .env from .env.example.\n'
 fi
 
 
@@ -100,16 +100,16 @@ configured_email=$(awk '
 case "$configured_email" in
     ''|'""'|"''"|\#*)
         [[ -t 0 ]] || fail 'Email setup needs an interactive terminal. Run ./install.sh in Terminal.'
-        printf '\nBridge contact email\n'
-        printf '  Enter an address Tor operators can use to contact you about your bridge.\n'
+        progress '\nBridge contact email\n'
+        progress '  Enter an address Tor operators can use to contact you about your bridge.\n'
         while true; do
-            printf '\n  Your email: '
+            progress '\n  Your email: '
             IFS= read -r bridge_email || fail 'Email entry cancelled. Rerun setup to continue.'
             # Accept common email syntax; exclude Compose interpolation and quoting.
             if [[ "$bridge_email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
                 break
             fi
-            printf '  Enter an email such as you@example.com (without spaces).\n'
+            progress '  Enter an email such as you@example.com (without spaces).\n'
         done
         env_temp=$(mktemp "$PROJECT_DIR/.env.setup.XXXXXX")
         if ! awk -v email="$bridge_email" '
@@ -128,9 +128,9 @@ case "$configured_email" in
             rm -f "$env_temp"
             fail 'Could not replace .env with the updated configuration.'
         fi
-        printf '  Email saved. Other bridge settings were preserved.\n'
+        progress '  Email saved. Other bridge settings were preserved.\n'
         ;;
-    *) printf 'Using the contact email already configured in .env.\n' ;;
+    *) progress 'Using the contact email already configured in .env.\n' ;;
 esac
 
 if ! compose config --quiet; then
@@ -158,16 +158,16 @@ BOOTSTRAP_VERIFIED=false
 if run_bounded 300 /bin/bash "$PROJECT_DIR/scripts/bridge-runtime.sh" \
     "$DOCKER" "$COMPOSE" "$PROJECT_DIR" "$CONTEXT" "$BOOTSTRAP_CACHE" "$GREEN" "$RESET"; then
     BOOTSTRAP_VERIFIED=true
-    printf '  Bootstrap success was observed during this container session.\n'
+    progress '  Bootstrap success was observed during this container session.\n'
 else
     result=$?
     if [[ $result -eq 1 || $result -eq 124 ]]; then
-        printf '  Bootstrap could not be confirmed within 5 minutes. No container was stopped.\n'
-        printf '  Older sessions without a saved success record may need a restart if their logs have rotated.\n'
+        progress '  Bootstrap could not be confirmed within 5 minutes. No container was stopped.\n'
+        progress '  Older sessions without a saved success record may need a restart if their logs have rotated.\n'
     else
-        printf '  Bootstrap verification failed; check Docker, the container, and local file permissions.\n'
+        progress '  Bootstrap verification failed; check Docker, the container, and local file permissions.\n'
     fi
-    printf '  Inspect logs: docker-compose --context colima-easy-tor-bridge logs -f --tail=100\n'
+    progress '  Inspect logs: docker-compose --context colima-easy-tor-bridge logs -f --tail=100\n'
 fi
 
 heading '[6/6] Local network diagnostics'
@@ -185,17 +185,17 @@ configure_autostart() {
     local answer
     AUTOSTART_STATUS='Not configured'
     heading 'Automatic startup'
-    printf '  Colima starts at login and stays running after logout while the Mac is awake.\n'
-    printf '  Enable automatic startup? [y/n]: '
+    progress '  Colima starts at login and stays running after logout while the Mac is awake.\n'
+    progress '  Enable automatic startup? [y/n]: '
     if [[ ! -t 0 ]]; then
-        printf '\n'
+        progress '\n'
         warning 'No interactive terminal; automatic startup settings were left unchanged.'
         AUTOSTART_STATUS='Unchanged (not checked)'
         return
     fi
     while true; do
         if ! IFS= read -r answer; then
-            printf '\n'
+            progress '\n'
             warning 'No answer; automatic startup settings were left unchanged.'
             AUTOSTART_STATUS='Unchanged (not checked)'
             return
@@ -205,7 +205,7 @@ configure_autostart() {
             n|N|no|NO)
                 set_autostart off
                 return ;;
-            *) printf '  Please enter y or n: ' ;;
+            *) progress '  Please enter y or n: ' ;;
         esac
     done
     set_autostart on
@@ -227,10 +227,10 @@ show_bridge_status() {
         return 0
     fi
     url="https://bridges.torproject.org/status?id=$fingerprint"
-    printf '\nTor bridge status:\n  %s\n' "$url"
-    printf '  Status information may lag; opening this page does not verify current Internet reachability.\n'
+    progress '\nTor bridge status:\n  %s\n' "$url"
+    progress '  Status information may lag; opening this page does not verify current Internet reachability.\n'
     if [[ -t 0 ]]; then
-        printf '  Open status page in your browser? [y/N]: '
+        progress '  Open status page in your browser? [y/N]: '
         IFS= read -r answer || answer=''
         case "$answer" in
             y|Y|yes|YES) open "$url" || warning 'Could not open the browser; use the link above.' ;;
@@ -241,11 +241,11 @@ show_bridge_status() {
 
 heading 'Setup Complete'
 success 'Tor bootstrap — Complete'
-printf '  Local networking — %s\n' "$LOCAL_NETWORK_STATUS"
+progress '  Local networking — %s\n' "$LOCAL_NETWORK_STATUS"
 warning 'Internet reachability — Unverified'
-printf '  Automatic startup — %s\n' "$AUTOSTART_STATUS"
+progress '  Automatic startup — %s\n' "$AUTOSTART_STATUS"
 show_bridge_status
-printf '\nKeep your Mac awake. Home routers may require forwarding both TCP ports.\n'
+progress '\nKeep your Mac awake. Home routers may require forwarding both TCP ports.\n'
 if [[ "$AUTOSTART_STATUS" != 'Enabled at login' ]]; then
-    printf 'Run bridge up (or ./bridge from this repository) to start the bridge.\n'
+    progress 'Run bridge up (or ./bridge from this repository) to start the bridge.\n'
 fi

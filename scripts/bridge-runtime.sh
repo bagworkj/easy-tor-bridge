@@ -1,6 +1,12 @@
 #!/bin/bash
 # Sourced by install.sh, or run as a bootstrap-check worker under a watchdog.
 
+# Pace our progress messages only when someone is watching in a terminal.
+progress() {
+    if [[ -t 1 ]]; then sleep 0.2; fi
+    printf "$@"
+}
+
 compose() {
     (
         # Saved project configuration wins over unrelated shell/Compose settings.
@@ -85,7 +91,7 @@ wait_for_bootstrap() {
             *) return 2 ;;
         esac
         if [[ $waiting == false ]]; then
-            printf '  Waiting for Tor to bootstrap (up to 5 minutes)...\n'
+            progress '  Waiting for Tor to bootstrap (up to 5 minutes)...\n'
             waiting=true
         fi
         sleep 5
@@ -157,14 +163,14 @@ install_bridge_command() {
     mkdir -p "$(dirname "$target")"
     if [[ -e "$target" || -L "$target" ]]; then
         if [[ -L "$target" && $(readlink "$target") == "$PROJECT_DIR/bridge" ]]; then
-            printf '  bridge command — Already installed\n'
+            progress '  bridge command — Already installed\n'
         else
             warning 'Existing ~/.local/bin/bridge was preserved; use ./bridge from this repository.'
             return
         fi
     else
         ln -s "$PROJECT_DIR/bridge" "$target"
-        printf '  bridge command — Installed in ~/.local/bin\n'
+        progress '  bridge command — Installed in ~/.local/bin\n'
     fi
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) ;;
@@ -177,7 +183,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     set -euo pipefail
     DOCKER=$1 COMPOSE=$2 PROJECT_DIR=$3 CONTEXT=$4 BOOTSTRAP_CACHE=$5
     GREEN=${6:-} RESET=${7:-}
-    success() { printf '  %s✓ %s%s\n' "$GREEN" "$*" "$RESET"; }
+    success() { progress '  %s✓ %s%s\n' "$GREEN" "$*" "$RESET"; }
     # Keep error handling inside the function active rather than implicit errexit.
     if wait_for_bootstrap; then exit 0; else exit $?; fi
 fi

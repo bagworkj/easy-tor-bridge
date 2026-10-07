@@ -26,7 +26,7 @@ def functions(*names):
     if (ROOT / 'bridge').exists():
         source += '\n' + (ROOT / 'bridge').read_text()
     found = []
-    for name in names:
+    for name in ('progress', *names):
         match = re.search(r'^' + name + r'\(\) \{\n.*?^\}', source, re.M | re.S)
         if not match:  # One-line functions in the original installer.
             match = re.search(r'^' + name + r'\(\) \{[^\n]*\}', source, re.M)
